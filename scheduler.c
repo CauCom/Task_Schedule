@@ -62,6 +62,11 @@ void init_queue() {
     pq.count = 0;
     pq.time_quantum = TIME_QUANTUM;
     pq.current_running = -1;
+
+    // Initialize queue indices
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pq.queue[i] = -1;
+    }
 }
 
 void load_programs() {
@@ -78,52 +83,52 @@ void load_programs() {
     
     printf("Đang tải các chương trình từ thư mục ./programs/\n");
     
-    while ((entry = readdir(dir)) != NULL && pq.count < MAX_PROCESSES) {
+    while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
         
         char full_path[512];
         snprintf(full_path, sizeof(full_path), "./programs/%s", entry->d_name);
         
-        if (stat(full_path, &file_stat) == 0 && (file_stat.st_mode & S_IXUSR)) {
-            // Đây là file executable
-            int burst_time = 10 + (rand() % 15); // Random burst time 10-25s
-            enqueue_process(entry->d_name, full_path, burst_time);
-            printf("Đã thêm chương trình: %s (burst time: %d giây)\n", 
-                   entry->d_name, burst_time);
+        if (/* file executable */) {
+            int idx = -1;
+            // Find empty slot
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                if (pq.processes[i].pid == 0) {
+                    idx = i;
+                    break;
+                }
+            }
+
+            if (idx != -1) {
+                // Initialize process
+                strcpy(pq.processes[idx].program_name, entry->d_name);
+                // ... [các thông số khác] ...
+
+                enqueue_process(idx); // Thêm vào hàng đợi
+            }
         }
     }
     closedir(dir);
 }
 
-int enqueue_process(const char* program_name, const char* executable_path, int burst_time) {
-    if (pq.count >= MAX_PROCESSES) {
-        printf("Hàng đợi đầy!\n");
-        return -1;
-    }
-    
+int enqueue_process(int index) {
+    if (pq.count >= MAX_PROCESSES) return -1;
+
     pq.rear = (pq.rear + 1) % MAX_PROCESSES;
-    Process* proc = &pq.processes[pq.rear];
-    
-    strcpy(proc->program_name, program_name);
-    strcpy(proc->executable_path, executable_path);
-    proc->burst_time = burst_time;
-    proc->remaining_time = burst_time;
-    proc->state = READY;
-    proc->pid = 0;
-    proc->start_time = 0;
-    
+    pq.queue[pq.rear] = index;
     pq.count++;
+
+    pq.processes[index].state = READY;
     return pq.rear;
 }
+int dequeue_process() {
+    if (pq.count == 0) return -1;
 
-Process* dequeue_process() {
-    if (pq.count == 0) return NULL;
-    
-    Process* proc = &pq.processes[pq.front];
+    int index = pq.queue[pq.front];
     pq.front = (pq.front + 1) % MAX_PROCESSES;
     pq.count--;
-    
-    return proc;
+
+    return index;
 }
 
 int create_process(Process* proc) {
@@ -204,10 +209,8 @@ void cleanup_processes() {
     printf("\n[CLEANUP] Dọn dẹp tất cả processes...\n");
     
     for (int i = 0; i < MAX_PROCESSES; i++) {
-        Process* p = &pq.processes[i];
-        if (p->pid > 0 && p->state != TERMINATED) {
-            printf("Kết thúc process: %s (PID: %d)\n", p->program_name, p->pid);
-            kill(p->pid, SIGTERM);
+        if (pq.processes[i].pid > 0) {
+            kill(pq.processes[i].pid, SIGTERM);
             
             // Đợi process kết thúc
             int status;
@@ -257,37 +260,23 @@ void run_scheduler() {
         print_queue_status();
         
         // Tìm process READY tiếp theo
-        int next_process = -1;
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            int idx = (pq.front + i) % MAX_PROCESSES;
-            Process* p = &pq.processes[idx];
-            
-            if (p->state == READY && p->remaining_time > 0) {
-                next_process = idx;
-                break;
-            }
-        }
         
-        if (next_process == -1) {
-            printf("Không có process nào sẵn sàng. Kết thúc scheduler.\n");
-            break;
-        }
-        
-        Process* current = &pq.processes[next_process];
-        pq.current_running = next_process;
+
+            // Dequeue next process
+        int proc_index = dequeue_process();
+        if (proc_index == -1) break;
+
+        Process* current = &pq.processes[proc_index];
+        pq.current_running = proc_index;
         current->state = RUNNING;
         current->start_time = time(NULL);
-        
-        printf("\n[SCHEDULER] Chuyển đến process: %s (PID: %d)\n", 
-               current->program_name, current->pid);
-        printf("Thời gian còn lại: %d giây\n", current->remaining_time);
         
         // Resume process
         kill(current->pid, SIGCONT);
         
         // Đợi time quantum hoặc process kết thúc
-        int runtime = (current->remaining_time < pq.time_quantum) ? 
-                     current->remaining_time : pq.time_quantum;
+        int runtime = (current->remaining_time < pq.time_quantum) ?
+            current->remaining_time : pq.time_quantum;
         
         for (int t = 0; t < runtime && scheduler_running; t++) {
             sleep(1);
@@ -311,20 +300,17 @@ void run_scheduler() {
         }
         
         if (current->state == RUNNING) {
-            // Pause process nếu vẫn đang chạy
             kill(current->pid, SIGSTOP);
             current->remaining_time -= runtime;
-            current->state = READY;
-            
-            printf("\n[SCHEDULER] Tạm dừng %s. Còn lại: %d giây\n", 
-                   current->program_name, current->remaining_time);
-            
-            if (current->remaining_time <= 0) {
-                printf("[SCHEDULER] %s đã hết thời gian burst, kết thúc.\n", 
-                       current->program_name);
-                kill(current->pid, SIGTERM);
+
+            // RE-ENQUEUE UNFINISHED PROCESS
+            if (current->remaining_time > 0) {
+                enqueue_process(proc_index);
+                printf("↻ Đưa %s vào cuối hàng đợi\n", current->program_name);
+            }
+            else {
                 current->state = TERMINATED;
-                pq.count--;
+                printf("✓ %s hoàn thành!\n", current->program_name);
             }
         }
         
@@ -333,8 +319,8 @@ void run_scheduler() {
         // Lưu trạng thái định kỳ
         save_state();
         
-        printf("\nChờ 2 giây trước khi chuyển process tiếp theo...\n");
-        sleep(2);
+        printf("\nChờ 1 giây trước khi chuyển process tiếp theo...\n");
+        sleep(1);
     }
     
     printf("\n[SCHEDULER] Hoàn thành tất cả processes!\n");
